@@ -20,6 +20,12 @@ class DetectionConfig:
     minimum_event_ms: float = 3
     minimum_signal_to_noise: float = 5.0
 
+    def __post_init__(self):
+        if isinstance(self.minimum_event_ms, bool) or not isinstance(self.minimum_event_ms, (int, float)):
+            raise ValueError("Minimum event duration must be a number in milliseconds")
+        if not math.isfinite(self.minimum_event_ms) or self.minimum_event_ms < 0:
+            raise ValueError("Minimum event duration must be finite and non-negative")
+
 
 CONFIG = DetectionConfig()
 
@@ -106,7 +112,9 @@ def detect_event(current_a: np.ndarray, sample_rate_hz: float, cfg: DetectionCon
 
     start_hold = max(1, round(cfg.start_hold_ms * sample_rate_hz / 1000.0))
     end_hold = max(1, round(cfg.end_hold_ms * sample_rate_hz / 1000.0))
-    minimum_event = max(1, round(cfg.minimum_event_ms * sample_rate_hz / 1000.0))
+    # Round up so a duration between sample boundaries cannot admit a shorter
+    # event. The tiny sample tolerance accommodates native timestamp round-off.
+    minimum_event = max(1, math.ceil(cfg.minimum_event_ms * sample_rate_hz / 1000.0 - 1e-7))
 
     events = []
     short_event_found = False
