@@ -1,5 +1,6 @@
 """Analytical checks, selection rules and optional native-reader integration."""
 import ctypes
+import io
 import os
 from pathlib import Path
 import sys
@@ -36,6 +37,19 @@ class AnalysisTests(unittest.TestCase):
         current[400:800] = 100
         current[2000:2400] = 200
         self.assertEqual(analysis.detect_event(current, FS), ((2000, 2400), "MULTIPLE_EVENTS"))
+
+    def test_adjustable_minimum_and_sample_boundary(self):
+        current = np.zeros(2000)
+        current[400:440] = 1000  # exactly 2 ms
+        for minimum in (0.0, 1.0, 2.0):
+            with self.subTest(minimum=minimum):
+                self.assertEqual(analysis.detect_event(current, FS, analysis.DetectionConfig(minimum_event_ms=minimum)),
+                                 ((400, 440), "OK"))
+        # A minimum between two sample boundaries must round up, not down.
+        self.assertEqual(analysis.detect_event(current, FS, analysis.DetectionConfig(minimum_event_ms=2.01))[1],
+                         "EVENT_SHORTER_THAN_MINIMUM")
+        self.assertEqual(analysis.detect_event(current, FS * (1 + 1e-10),
+                         analysis.DetectionConfig(minimum_event_ms=2.0))[0], (400, 440))
 
     def test_flat_short_and_invalid_signals(self):
         self.assertEqual(analysis.detect_event(np.zeros(1000), FS)[1], "NO_EVENT_DETECTED")
@@ -118,10 +132,48 @@ class SettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "nested" / "settings.json"
             self.assertIsNone(load_settings(path))
-            save_settings(ProcessingSettings(123.5), path)
+            save_settings(ProcessingSettings(123.5, minimum_event_ms=1.5), path)
             self.assertEqual(load_settings(path).ct_min_peak_a, 123.5)
+            self.assertEqual(load_settings(path).minimum_event_ms, 1.5)
             save_settings(ProcessingSettings(200.0), path)
             self.assertEqual(load_settings(path).ct_min_peak_a, 200.0)
+
+    def test_legacy_settings_keep_previous_minimum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text('{"ct_min_peak_a": 200}')
+            self.assertEqual(load_settings(path), ProcessingSettings(200, minimum_event_ms=3.0))
+
+    def test_invalid_minimum_duration(self):
+        for value in (-1, float("nan"), float("inf"), "2", True, None):
+            for cls in (ProcessingSettings, analysis.DetectionConfig):
+                with self.subTest(value=value, cls=cls), self.assertRaises(ValueError):
+                    if cls is ProcessingSettings:
+                        cls(200, minimum_event_ms=value)
+                    else:
+                        cls(minimum_event_ms=value)
+
+    def test_cli_overrides_preserve_other_settings_and_survive_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test.dxd").touch()
+            settings_path = root / "settings.json"
+            save_settings(ProcessingSettings(200, minimum_event_ms=2.0), settings_path)
+            library = Mock()
+            library.DWICreateReader.return_value = 0
+            library.DWIDestroyReader.return_value = 0
+            def run(*options):
+                argv = ["process_dxd_folder", str(root), "--settings", str(settings_path), *options]
+                with patch.object(sys, "argv", argv), patch.object(sys, "stdout", io.StringIO()), \
+                        patch.object(processor, "load_library", return_value=library), \
+                        patch.object(processor, "configure_library", return_value=library), \
+                        patch.object(processor, "process_file", return_value=[]) as process:
+                    processor.main()
+                    return process.call_args.args[2]
+            self.assertEqual(run("--ct-min-peak-a", "350"), ProcessingSettings(350, 2.0))
+            self.assertEqual(run("--minimum-event-ms", "1"), ProcessingSettings(350, 1.0))
+            self.assertEqual(load_settings(settings_path), ProcessingSettings(350, 1.0))
+            self.assertEqual(run(), ProcessingSettings(350, 1.0))
 
     def test_invalid_settings_cannot_silently_change_selection(self):
         for value in [-1, float("nan"), float("inf"), "200", True]:
@@ -158,6 +210,11 @@ class PipelineTests(unittest.TestCase):
         with patch.object(processor, "lib", library), patch.object(processor, "get_channels", return_value=channels), \
                 patch.object(processor, "read_channel", side_effect=lambda reader, ch, rate: data[ch.index]):
             results = processor.analyse_open_file(None, Path("test.dxd"), ProcessingSettings(200))
+            filtered = processor.analyse_open_file(None, Path("test.dxd"), ProcessingSettings(200, minimum_event_ms=25))
+        for result in filtered:
+            self.assertIsNone(result.event)
+            self.assertEqual(result.row["Minimum Event Duration (ms)"], 25)
+            self.assertEqual(result.row["Status"], "EVENT_SHORTER_THAN_MINIMUM")
         for i, result in enumerate(results):
             start = 400 + i * 200
             self.assertEqual(result.event, (start, start + 400))
@@ -189,6 +246,15 @@ class NativeReaderTests(unittest.TestCase):
                             self.assertGreater(row["Duration (s)"], 0)
                             self.assertGreater(row["RMS Voltage (V)"], 0)
                             self.assertEqual(row["Voltage RMS End Time (s)"], row["Start Time (s)"])
+                    if name == "8361_Test13_1.dxd":
+                        blue = next(row for row in rows if row["Phase"] == "Blue")
+                        self.assertEqual(blue["Status"], "EVENT_SHORTER_THAN_MINIMUM")
+                        adjusted = processor.process_file(reader, matches[0], ProcessingSettings(200, minimum_event_ms=2))
+                        blue = next(row for row in adjusted if row["Phase"] == "Blue")
+                        self.assertEqual(blue["Status"], "OK")
+                        self.assertEqual(blue["Minimum Event Duration (ms)"], 2)
+                        self.assertGreaterEqual(blue["Duration (s)"], 0.002)
+                        self.assertLess(blue["Duration (s)"], 0.003)
         finally:
             processor.check_error(processor.lib, processor.lib.DWIDestroyReader(reader))
 
