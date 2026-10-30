@@ -21,10 +21,22 @@ class DetectionConfig:
     minimum_signal_to_noise: float = 5.0
 
     def __post_init__(self):
-        if isinstance(self.minimum_event_ms, bool) or not isinstance(self.minimum_event_ms, (int, float)):
-            raise ValueError("Minimum event duration must be a number in milliseconds")
-        if not math.isfinite(self.minimum_event_ms) or self.minimum_event_ms < 0:
-            raise ValueError("Minimum event duration must be finite and non-negative")
+        for name, value in self.__dict__.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.rms_window_ms <= 0:
+            raise ValueError("rms_window_ms must be greater than zero")
+        for name in ("start_fraction_of_peak", "end_fraction_of_peak"):
+            if not 0 < getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be greater than zero and at most 1")
+        if self.end_fraction_of_peak > self.start_fraction_of_peak:
+            raise ValueError("End peak fraction must not exceed start peak fraction")
+        if self.end_noise_multiplier > self.start_noise_multiplier:
+            raise ValueError("End noise multiplier must not exceed start noise multiplier")
+        if self.minimum_signal_to_noise < 1:
+            raise ValueError("minimum_signal_to_noise must be at least 1")
 
 
 CONFIG = DetectionConfig()
