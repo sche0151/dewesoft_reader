@@ -24,6 +24,17 @@ Invalid settings produce an error instead of silently selecting a different
 current source. A missing, negative or non-finite threshold is rejected; zero
 is permitted, but an exactly zero CT signal is still rejected.
 
+Minimum event duration is also a saved setting, shared across phases. Use
+`--minimum-event-ms VALUE` to change it; for example, `--minimum-event-ms 2`
+sets a 2 ms minimum. Omit the flag on later runs to reuse the saved value.
+Changing either setting preserves the other. Existing settings files that
+contain only the CT threshold retain the previous 3 ms minimum.
+
+The duration must be finite and non-negative. A value of `0` disables only the
+minimum-duration filter; the detector's other signal and hold-time criteria
+still apply. The value is available through `ProcessingSettings` for the future
+GUI settings panel, and each CSV row records `Minimum Event Duration (ms)`.
+
 ## Measurement rules
 
 - For each phase, prefer the CT if its maximum absolute scaled current over the
@@ -35,6 +46,9 @@ is permitted, but an exactly zero CT signal is still rejected.
   The existing RMS envelope and hold times locate candidate events; raw
   current threshold crossings refine the start and exclusive end indices.
   Metrics use original scaled samples, not the smoothed envelope.
+- The saved minimum event duration controls which detected events qualify.
+  Durations shorter than that minimum are flagged; a minimum between sample
+  boundaries rounds up to the next sample, allowing for timestamp round-off.
 - Current RMS, peak, duration and I²t are calculated within that event window.
 - Voltage RMS uses all available voltage samples from the beginning of the
   voltage signal up to, but excluding, that phase's current-event start.
@@ -93,14 +107,14 @@ expected I²t of 40,000 A²s.
 The native integration checks ran on Linux with the bundled library; Windows
 DLL execution and future executable packaging still need Windows validation.
 The supplied files are smoke-test inputs, not independently verified numerical
-references. Test13 blue is flagged `EVENT_SHORTER_THAN_MINIMUM` under the
-existing 3 ms minimum-event rule after raw-sample boundary refinement. This
-requires review against the intended measurement rules; the minimum was not
-silently reduced to make the recording pass.
+references. Test13 blue is flagged `EVENT_SHORTER_THAN_MINIMUM` at the default
+3 ms minimum; the integration test confirms it is included when the saved
+minimum is changed to 2 ms. These values demonstrate the setting's effect,
+not a recommendation for the appropriate measurement rule.
 
 ## Next desktop milestone
 
 Add a single-file review screen with channel selection, current/voltage plots,
-editable event boundaries, the shared CT threshold field, recalculation and
+editable event boundaries, shared CT threshold and minimum-duration fields, recalculation and
 CSV export. Validate representative results against independently checked
 measurements before packaging the Windows executable.
