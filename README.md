@@ -35,6 +35,32 @@ minimum-duration filter; the detector's other signal and hold-time criteria
 still apply. The value is available through `ProcessingSettings` for the future
 GUI settings panel, and each CSV row records `Minimum Event Duration (ms)`.
 
+All event-detection controls below are saved in the same settings file and
+shared across phases. Omitted options retain their saved values. Older settings
+files receive the defaults below for missing fields. Changing one option does
+not reset any others. All values must be finite numbers.
+
+| Command-line option | Default | Allowed values / meaning |
+| --- | --- | --- |
+| `--rms-window-ms` | 1 | Greater than 0; RMS envelope window in milliseconds |
+| `--start-fraction-of-peak` | 0.01 | Greater than 0 and at most 1; 0.01 means 1% |
+| `--end-fraction-of-peak` | 0.005 | Greater than 0 and no greater than the start fraction |
+| `--start-noise-multiplier` | 8 | Non-negative multiple of the estimated noise floor |
+| `--end-noise-multiplier` | 4 | Non-negative and no greater than the start multiplier |
+| `--start-hold-ms` | 0.25 | Non-negative; sustained time above the start threshold |
+| `--end-hold-ms` | 15 | Non-negative; sustained time below the end threshold |
+| `--minimum-event-ms` | 3 | Non-negative; 0 disables the minimum-duration filter |
+| `--minimum-signal-to-noise` | 5 | At least 1; minimum envelope peak/noise ratio |
+
+The start/end thresholds are calculated as the greater of the noise-floor
+multiple and `noise + fraction × (envelope peak − noise)`. Fractions apply to
+the envelope's range above the noise floor. Setting a hold time to 0 removes
+the extra hold requirement but still requires at least one qualifying sample.
+The RMS window and hold times are rounded to the nearest sample (at least one);
+minimum event duration rounds up. Every CSV row records all detector settings,
+including rows flagged for review. These preferences are available to the
+future GUI through `ProcessingSettings.detection_config()`.
+
 ## Measurement rules
 
 - For each phase, prefer the CT if its maximum absolute scaled current over the
@@ -115,6 +141,6 @@ not a recommendation for the appropriate measurement rule.
 ## Next desktop milestone
 
 Add a single-file review screen with channel selection, current/voltage plots,
-editable event boundaries, shared CT threshold and minimum-duration fields, recalculation and
+editable event boundaries, a measurement-settings panel, recalculation and
 CSV export. Validate representative results against independently checked
 measurements before packaging the Windows executable.
