@@ -1,5 +1,6 @@
 """Analytical checks, selection rules and optional native-reader integration."""
 import ctypes
+from dataclasses import replace
 import io
 import os
 from pathlib import Path
@@ -20,6 +21,36 @@ FS = 20_000.0
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_threshold_and_hold_settings_change_detected_events(self):
+        current = np.zeros(3000)
+        current[400:600] = 10
+        current[600:1000] = 100
+        self.assertEqual(analysis.detect_event(current, FS)[0], (400, 1000))
+        self.assertEqual(analysis.detect_event(current, FS,
+                         analysis.DetectionConfig(start_fraction_of_peak=0.5))[0], (600, 1000))
+        self.assertIsNone(analysis.detect_event(current, FS,
+                          analysis.DetectionConfig(start_hold_ms=100))[0])
+        current[:] = 0
+        current[400:600] = 100
+        current[800:1000] = 200  # 10 ms gap: merge with 15 ms hold; split with 5 ms.
+        self.assertEqual(analysis.detect_event(current, FS)[0], (400, 1000))
+        self.assertEqual(analysis.detect_event(current, FS,
+                         analysis.DetectionConfig(end_hold_ms=5)), ((800, 1000), "MULTIPLE_EVENTS"))
+
+    def test_rms_window_and_noise_settings_affect_detection(self):
+        current = np.zeros(2000)
+        current[400:420] = 1000
+        cfg = analysis.DetectionConfig(minimum_event_ms=0, start_hold_ms=2)
+        self.assertIsNone(analysis.detect_event(current, FS, cfg)[0])
+        self.assertEqual(analysis.detect_event(current, FS, replace(cfg, rms_window_ms=5))[0], (400, 420))
+        current[:] = 1
+        current[400:800] = 10
+        self.assertIsNotNone(analysis.detect_event(current, FS)[0])
+        self.assertIsNone(analysis.detect_event(current, FS,
+                          analysis.DetectionConfig(start_noise_multiplier=20))[0])
+        self.assertIsNone(analysis.detect_event(current, FS,
+                          analysis.DetectionConfig(minimum_signal_to_noise=20))[0])
+
     def test_rectangular_event_has_exact_duration_rms_and_i2t(self):
         current = np.zeros(2000)
         current[400:1200] = -1000.0
@@ -128,6 +159,25 @@ class SelectionTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_all_detector_settings_round_trip_and_validate(self):
+        configured = ProcessingSettings(200, minimum_event_ms=2, rms_window_ms=2.5,
+            start_fraction_of_peak=0.05, end_fraction_of_peak=0.02,
+            start_noise_multiplier=10, end_noise_multiplier=3,
+            start_hold_ms=0.5, end_hold_ms=10, minimum_signal_to_noise=6)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            save_settings(configured, path)
+            self.assertEqual(load_settings(path), configured)
+            self.assertEqual(load_settings(path).detection_config(), configured.detection_config())
+        invalid = [{"rms_window_ms": 0}, {"start_fraction_of_peak": 1.1},
+            {"end_fraction_of_peak": 0}, {"end_fraction_of_peak": 0.1},
+            {"end_noise_multiplier": 9}, {"start_noise_multiplier": -1},
+            {"start_hold_ms": -1}, {"end_hold_ms": float("nan")},
+            {"minimum_signal_to_noise": 0.5}, {"rms_window_ms": True}]
+        for kwargs in invalid:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ProcessingSettings(200, **kwargs)
+
     def test_unset_and_saved_setting(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "nested" / "settings.json"
@@ -174,6 +224,14 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(run("--minimum-event-ms", "1"), ProcessingSettings(350, 1.0))
             self.assertEqual(load_settings(settings_path), ProcessingSettings(350, 1.0))
             self.assertEqual(run(), ProcessingSettings(350, 1.0))
+            advanced = dict(rms_window_ms=2, start_fraction_of_peak=0.03, end_fraction_of_peak=0.01,
+                start_noise_multiplier=10, end_noise_multiplier=5, start_hold_ms=0.5,
+                end_hold_ms=12, minimum_signal_to_noise=6)
+            flags = [part for key, value in advanced.items() for part in ("--" + key.replace("_", "-"), str(value))]
+            expected = replace(ProcessingSettings(350, 1.0), **advanced)
+            self.assertEqual(run(*flags), expected)
+            self.assertEqual(run(), expected)
+            self.assertEqual(run("--ct-min-peak-a", "400"), replace(expected, ct_min_peak_a=400))
 
     def test_invalid_settings_cannot_silently_change_selection(self):
         for value in [-1, float("nan"), float("inf"), "200", True]:
@@ -222,6 +280,8 @@ class PipelineTests(unittest.TestCase):
             self.assertAlmostEqual(result.row["RMS Voltage (V)"], np.sqrt(np.mean(np.arange(start, dtype=float) ** 2)))
             self.assertEqual(result.row["Status"], "OK")
             self.assertIsNotNone(result.current_a)
+            for name, column in processor.DETECTION_COLUMNS.items():
+                self.assertEqual(result.row[column], getattr(ProcessingSettings(200), name))
 
 
 @unittest.skipUnless(os.environ.get("DXD_TEST_DATA_DIR"), "Set DXD_TEST_DATA_DIR for native-reader checks")
