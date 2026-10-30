@@ -12,12 +12,17 @@ import tempfile
 @dataclass(frozen=True)
 class ProcessingSettings:
     ct_min_peak_a: float
+    minimum_event_ms: float = 3.0
 
     def __post_init__(self):
         if isinstance(self.ct_min_peak_a, bool) or not isinstance(self.ct_min_peak_a, (int, float)):
             raise ValueError("CT threshold must be a number in amps")
         if not math.isfinite(self.ct_min_peak_a) or self.ct_min_peak_a < 0:
             raise ValueError("CT threshold must be finite and non-negative")
+        if isinstance(self.minimum_event_ms, bool) or not isinstance(self.minimum_event_ms, (int, float)):
+            raise ValueError("Minimum event duration must be a number in milliseconds")
+        if not math.isfinite(self.minimum_event_ms) or self.minimum_event_ms < 0:
+            raise ValueError("Minimum event duration must be finite and non-negative")
 
 
 def default_settings_path() -> Path:
@@ -33,7 +38,8 @@ def load_settings(path: Path) -> ProcessingSettings | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return ProcessingSettings(ct_min_peak_a=data["ct_min_peak_a"])
+        return ProcessingSettings(ct_min_peak_a=data["ct_min_peak_a"],
+                                  minimum_event_ms=data.get("minimum_event_ms", 3.0))
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"Invalid settings file {path}: {exc}") from exc
 
