@@ -5,7 +5,7 @@ import csv
 import ctypes
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +30,24 @@ from DWDataReaderHeader import (
 PHASES = ("Red", "White", "Blue")
 EXPECTED_SAMPLE_RATE_HZ = 20_000.0
 
+DETECTION_COLUMNS = {
+    "rms_window_ms": "Detection RMS Window (ms)",
+    "start_fraction_of_peak": "Start Peak Fraction",
+    "end_fraction_of_peak": "End Peak Fraction",
+    "start_noise_multiplier": "Start Noise Multiplier",
+    "end_noise_multiplier": "End Noise Multiplier",
+    "start_hold_ms": "Start Hold (ms)",
+    "end_hold_ms": "End Hold (ms)",
+    "minimum_event_ms": "Minimum Event Duration (ms)",
+    "minimum_signal_to_noise": "Minimum Signal to Noise",
+}
 lib = None
+
+
+def settings_columns(settings: ProcessingSettings) -> dict:
+    return {"CT Minimum Peak (A)": settings.ct_min_peak_a,
+            **{column: getattr(settings, name) for name, column in DETECTION_COLUMNS.items()}}
+
 
 
 def channel_name(ch: DWChannel) -> str:
@@ -196,7 +213,7 @@ def empty_row(filename: str, phase: str):
         "Current Source": "",
         "Current Channel": "",
         "CT Minimum Peak (A)": "",
-        "Minimum Event Duration (ms)": "",
+        **dict.fromkeys(DETECTION_COLUMNS.values(), ""),
         "CT Peak (A)": "",
         "Current Selection Reason": "",
         "Voltage Channel": "",
@@ -285,8 +302,7 @@ def analyse_open_file(reader: READER_HANDLE, path: Path, settings: ProcessingSet
     results = []
     for phase in PHASES:
         row = empty_row(path.name, phase)
-        row["CT Minimum Peak (A)"] = settings.ct_min_peak_a
-        row["Minimum Event Duration (ms)"] = settings.minimum_event_ms
+        row.update(settings_columns(settings))
         result = PhaseAnalysis(row)
         results.append(result)
         ct, shunt, voltage_ch, warnings = selections[phase]
@@ -326,7 +342,7 @@ def analyse_open_file(reader: READER_HANDLE, path: Path, settings: ProcessingSet
             if not math.isclose(sample_rate_hz, EXPECTED_SAMPLE_RATE_HZ, rel_tol=0.0, abs_tol=1.0):
                 statuses.append(f"UNEXPECTED_SAMPLE_RATE_{sample_rate_hz:g}Hz")
             event, event_status = detect_event(
-                current_a, sample_rate_hz, DetectionConfig(minimum_event_ms=settings.minimum_event_ms))
+                current_a, sample_rate_hz, settings.detection_config())
             if event is None:
                 statuses.append(event_status)
                 row["Status"] = ";".join(statuses)
@@ -410,8 +426,10 @@ def main():
     )
     parser.add_argument("--recursive", action="store_true", help="Also search subfolders")
     parser.add_argument("--ct-min-peak-a", type=float, help="Shared CT peak threshold in amps; saved for future runs")
-    parser.add_argument("--minimum-event-ms", type=float,
-                        help="Minimum event duration in ms; saved for future runs (default: 3; 0 disables duration filtering)")
+    for field in fields(DetectionConfig):
+        note = "; 0 disables duration filtering" if field.name == "minimum_event_ms" else ""
+        parser.add_argument("--" + field.name.replace("_", "-"), type=float,
+                            help=f"{DETECTION_COLUMNS[field.name]}; saved for future runs (default: {field.default}{note})")
     parser.add_argument("--settings", type=Path, default=default_settings_path(), help="Settings JSON path")
     args = parser.parse_args()
     try:
@@ -419,9 +437,8 @@ def main():
         if settings is None and args.ct_min_peak_a is not None:
             settings = ProcessingSettings(args.ct_min_peak_a)
         if settings is not None:
-            overrides = {key: value for key, value in (
-                ("ct_min_peak_a", args.ct_min_peak_a), ("minimum_event_ms", args.minimum_event_ms))
-                if value is not None}
+            overrides = {field.name: getattr(args, field.name) for field in fields(ProcessingSettings)
+                         if getattr(args, field.name) is not None}
             settings = replace(settings, **overrides)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
@@ -437,7 +454,7 @@ def main():
     if not files:
         raise SystemExit(f"No .dxd files found in {folder}")
 
-    if args.ct_min_peak_a is not None or args.minimum_event_ms is not None:
+    if overrides:
         try:
             save_settings(settings, args.settings)
         except OSError as exc:
@@ -458,8 +475,7 @@ def main():
                 # Keep the batch running and leave an auditable failure row for each phase.
                 for phase in PHASES:
                     row = empty_row(path.name, phase)
-                    row["CT Minimum Peak (A)"] = settings.ct_min_peak_a
-                    row["Minimum Event Duration (ms)"] = settings.minimum_event_ms
+                    row.update(settings_columns(settings))
                     row["Status"] = f"FILE_ERROR:{exc}"
                     rows.append(row)
     finally:
