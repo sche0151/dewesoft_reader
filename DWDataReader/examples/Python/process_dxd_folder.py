@@ -28,7 +28,7 @@ PHASES = ("Red", "White", "Blue")
 EXPECTED_SAMPLE_RATE_HZ = 20_000.0
 
 '''
-python DWDataReader/examples/Python/process_dxd_folder.py "D:/Eaton_P02478763_252108361" -o results_new.csv
+python DWDataReader/examples/Python/process_dxd_folder.py "D:/Eaton_P02478763_252108362" -o results.csv
 '''
 
 @dataclass(frozen=True)
