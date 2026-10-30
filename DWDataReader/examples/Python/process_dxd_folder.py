@@ -5,11 +5,14 @@ import csv
 import ctypes
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
+
+from dxd_analysis import (DetectionConfig, calculate_current_metrics, calculate_voltage_rms, detect_event,
+                          ct_is_usable, validate_signal)
+from dxd_settings import ProcessingSettings, default_settings_path, load_settings, save_settings
 
 from DWDataReaderHeader import (
     DWChannel,
@@ -27,26 +30,24 @@ from DWDataReaderHeader import (
 PHASES = ("Red", "White", "Blue")
 EXPECTED_SAMPLE_RATE_HZ = 20_000.0
 
-'''
-python DWDataReader/examples/Python/process_dxd_folder.py "D:/Eaton_P02478763_252108361" -o results_new.csv
-'''
-
-@dataclass(frozen=True)
-class DetectionConfig:
-    # Detection only. Metrics are always calculated from the original samples.
-    rms_window_ms: float = 1.0
-    start_fraction_of_peak: float = 0.01
-    end_fraction_of_peak: float = 0.005
-    start_noise_multiplier: float = 8.0
-    end_noise_multiplier: float = 4.0
-    start_hold_ms: float = 0.25
-    end_hold_ms: float = 15.0
-    minimum_event_ms: float = 3
-    minimum_signal_to_noise: float = 5.0
-
-
-CONFIG = DetectionConfig()
+DETECTION_COLUMNS = {
+    "rms_window_ms": "Detection RMS Window (ms)",
+    "start_fraction_of_peak": "Start Peak Fraction",
+    "end_fraction_of_peak": "End Peak Fraction",
+    "start_noise_multiplier": "Start Noise Multiplier",
+    "end_noise_multiplier": "End Noise Multiplier",
+    "start_hold_ms": "Start Hold (ms)",
+    "end_hold_ms": "End Hold (ms)",
+    "minimum_event_ms": "Minimum Event Duration (ms)",
+    "minimum_signal_to_noise": "Minimum Signal to Noise",
+}
 lib = None
+
+
+def settings_columns(settings: ProcessingSettings) -> dict:
+    return {"CT Minimum Peak (A)": settings.ct_min_peak_a,
+            **{column: getattr(settings, name) for name, column in DETECTION_COLUMNS.items()}}
+
 
 
 def channel_name(ch: DWChannel) -> str:
@@ -78,19 +79,12 @@ def choose_phase_channels(channels: list[DWChannel], phase: str):
 
     warnings = []
 
-    if cts:
-        current = sorted(cts, key=lambda ch: ch.index)[0]
-        current_source = "C.T."
-        if len(cts) > 1:
-            warnings.append("MULTIPLE_CT_CHANNELS")
-    elif shunts:
-        current = sorted(shunts, key=lambda ch: ch.index)[0]
-        current_source = "Shunt"
-        if len(shunts) > 1:
-            warnings.append("MULTIPLE_SHUNT_CHANNELS")
-    else:
-        current = None
-        current_source = ""
+    ct = min(cts, key=lambda ch: ch.index) if cts else None
+    shunt = min(shunts, key=lambda ch: ch.index) if shunts else None
+    if len(cts) > 1:
+        warnings.append("MULTIPLE_CT_CHANNELS")
+    if len(shunts) > 1:
+        warnings.append("MULTIPLE_SHUNT_CHANNELS")
 
     if voltages:
         voltage = sorted(voltages, key=lambda ch: ch.index)[0]
@@ -99,7 +93,32 @@ def choose_phase_channels(channels: list[DWChannel], phase: str):
     else:
         voltage = None
 
-    return current, current_source, voltage, warnings
+    return ct, shunt, voltage, warnings
+
+
+def configure_library(library):
+    """Declare the ABI used here, particularly 64-bit sample positions."""
+    pointer = ctypes.POINTER
+    signatures = {
+        "DWICreateReader": [pointer(READER_HANDLE)],
+        "DWIDestroyReader": [READER_HANDLE],
+        "DWIOpenDataFile": [READER_HANDLE, ctypes.c_char_p, pointer(DWFileInfo)],
+        "DWICloseDataFile": [READER_HANDLE],
+        "DWIGetMeasurementInfo": [READER_HANDLE, pointer(DWMeasurementInfo)],
+        "DWIGetChannelListCount": [READER_HANDLE, pointer(ctypes.c_int)],
+        "DWIGetChannelList": [READER_HANDLE, pointer(DWChannel)],
+        "DWIGetChannelProps": [READER_HANDLE, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                               pointer(ctypes.c_int)],
+        "DWIGetScaledSamplesCount": [READER_HANDLE, ctypes.c_int, pointer(ctypes.c_longlong)],
+        "DWIGetScaledSamples": [READER_HANDLE, ctypes.c_int, ctypes.c_longlong, ctypes.c_int,
+                                pointer(ctypes.c_double), pointer(ctypes.c_double)],
+        "DWGetLastStatus": [pointer(ctypes.c_int), ctypes.c_void_p, pointer(ctypes.c_int)],
+    }
+    for name, args in signatures.items():
+        function = getattr(library, name)
+        function.argtypes = args
+        function.restype = ctypes.c_int
+    return library
 
 
 def unit_factor_to_si(unit: str, quantity: str) -> float:
@@ -161,180 +180,30 @@ def read_channel(reader: READER_HANDLE, ch: DWChannel, sample_rate_hz: float):
     n = sample_count.value
     if n <= 0:
         raise ValueError(f"Channel has no samples: {channel_name(ch)!r}")
+    if n > 2_147_483_647:
+        raise ValueError("Channel exceeds the single-read limit; chunked reading is required")
 
     samples_c = (ctypes.c_double * n)()
     ch_type = get_channel_type(reader, ch)
 
-    timestamps_c = None
-    if ch_type == DWChannelType.DW_CH_TYPE_ASYNC:
-        timestamps_c = (ctypes.c_double * n)()
+    if ch_type not in (DWChannelType.DW_CH_TYPE_SYNC, DWChannelType.DW_CH_TYPE_ASYNC):
+        raise ValueError(f"Unsupported channel type: {ch_type.name}")
+    # Read native timestamps for both types to preserve channel alignment and
+    # channels stored at a rate different from the measurement base rate.
+    timestamps_c = (ctypes.c_double * n)()
 
     check_error(
         lib,
-        lib.DWIGetScaledSamples(reader, ch.index, 0, sample_count, samples_c, timestamps_c),
+        lib.DWIGetScaledSamples(reader, ch.index, 0, n, samples_c, timestamps_c),
     )
 
     samples = np.ctypeslib.as_array(samples_c).astype(np.float64, copy=True)
 
-    if timestamps_c is None:
-        timestamps = np.arange(n, dtype=np.float64) / sample_rate_hz
-        is_async = False
-    else:
-        timestamps = np.ctypeslib.as_array(timestamps_c).astype(np.float64, copy=True)
-        is_async = True
+    timestamps = np.ctypeslib.as_array(timestamps_c).astype(np.float64, copy=True)
+    validate_signal(samples, timestamps)
+    is_async = ch_type == DWChannelType.DW_CH_TYPE_ASYNC
 
     return samples, timestamps, is_async
-
-
-def moving_rms(values: np.ndarray, window_samples: int) -> np.ndarray:
-    window_samples = max(1, int(window_samples))
-    kernel = np.ones(window_samples, dtype=np.float64) / window_samples
-    return np.sqrt(np.convolve(np.square(values), kernel, mode="same"))
-
-
-def _first_sustained(mask: np.ndarray, length: int, start: int = 0) -> Optional[int]:
-    length = max(1, int(length))
-    if start >= mask.size:
-        return None
-
-    segment = mask[start:].astype(np.int8, copy=False)
-    if segment.size < length:
-        return None
-
-    if length == 1:
-        hits = np.flatnonzero(segment)
-    else:
-        runs = np.convolve(segment, np.ones(length, dtype=np.int16), mode="valid")
-        hits = np.flatnonzero(runs == length)
-
-    if hits.size == 0:
-        return None
-    return start + int(hits[0])
-
-
-def detect_event(current_a: np.ndarray, sample_rate_hz: float, cfg: DetectionConfig = CONFIG):
-    n = current_a.size
-    if n < 2:
-        return None, "NO_EVENT_DETECTED"
-
-    window = max(1, round(cfg.rms_window_ms * sample_rate_hz / 1000.0))
-    envelope = moving_rms(current_a, window)
-
-    # The lower percentile is a robust estimate of the non-event floor even if
-    # the file contains a substantial active-current region.
-    noise_floor = float(np.percentile(envelope, 10.0))
-    peak_envelope = float(np.max(envelope))
-
-    noise_reference = max(noise_floor, np.finfo(float).eps)
-    if peak_envelope / noise_reference < cfg.minimum_signal_to_noise:
-        return None, "NO_EVENT_DETECTED"
-
-    dynamic_range = max(0.0, peak_envelope - noise_floor)
-    start_threshold = max(
-        noise_floor * cfg.start_noise_multiplier,
-        noise_floor + cfg.start_fraction_of_peak * dynamic_range,
-    )
-    end_threshold = max(
-        noise_floor * cfg.end_noise_multiplier,
-        noise_floor + cfg.end_fraction_of_peak * dynamic_range,
-    )
-    end_threshold = min(end_threshold, start_threshold)
-
-    start_hold = max(1, round(cfg.start_hold_ms * sample_rate_hz / 1000.0))
-    end_hold = max(1, round(cfg.end_hold_ms * sample_rate_hz / 1000.0))
-    minimum_event = max(1, round(cfg.minimum_event_ms * sample_rate_hz / 1000.0))
-
-    events = []
-    search_from = 0
-
-    while search_from < n:
-        start = _first_sustained(envelope >= start_threshold, start_hold, search_from)
-        if start is None:
-            break
-
-        end_low = _first_sustained(envelope <= end_threshold, end_hold, start + start_hold)
-        if end_low is None:
-            end = n
-        else:
-            end = end_low
-
-        # np.convolve(..., mode="same") centres the RMS window. Correct the
-        # approximate boundary by half a window before calculating metrics.
-        start = max(0, start - window // 2)
-        end = min(n, end + window // 2)
-
-        if end - start >= minimum_event:
-            energy_score = float(np.sum(np.square(current_a[start:end])))
-            events.append((start, end, energy_score))
-
-        if end_low is None:
-            break
-        search_from = max(end + 1, end_low + end_hold)
-
-    if not events:
-        return None, "NO_EVENT_DETECTED"
-
-    # A normal test should contain one event. If several are present, analyse
-    # the event carrying the most I^2 content and flag the row for review.
-    start, end, _ = max(events, key=lambda item: item[2])
-    status = "MULTIPLE_EVENTS" if len(events) > 1 else "OK"
-    return (start, end), status
-
-
-def sample_widths(timestamps: np.ndarray, sample_rate_hz: float, is_async: bool) -> np.ndarray:
-    if not is_async:
-        return np.full(timestamps.size, 1.0 / sample_rate_hz, dtype=np.float64)
-
-    if timestamps.size == 1:
-        return np.array([1.0 / sample_rate_hz], dtype=np.float64)
-
-    dt = np.diff(timestamps)
-    positive_dt = dt[dt > 0]
-    fallback = float(np.median(positive_dt)) if positive_dt.size else 1.0 / sample_rate_hz
-    dt = np.where(dt > 0, dt, fallback)
-    return np.concatenate([dt, np.array([fallback])])
-
-
-def calculate_current_metrics(
-    current_a: np.ndarray,
-    timestamps: np.ndarray,
-    is_async: bool,
-    sample_rate_hz: float,
-    start: int,
-    end: int,
-):
-    values = current_a[start:end]
-    times = timestamps[start:end]
-    widths = sample_widths(times, sample_rate_hz, is_async)
-
-    peak_current_a = float(np.max(np.abs(values)))
-    rms_current_a = float(np.sqrt(np.mean(np.square(values))))
-    i2t_a2s = float(np.sum(np.square(values) * widths))
-    duration_s = float(np.sum(widths))
-    start_time_s = float(times[0])
-    end_time_s = start_time_s + duration_s if not is_async else float(times[-1] + widths[-1])
-
-    return {
-        "start_time_s": start_time_s,
-        "end_time_s": end_time_s,
-        "duration_s": duration_s,
-        "peak_current_a": peak_current_a,
-        "rms_current_a": rms_current_a,
-        "i2t_a2s": i2t_a2s,
-    }
-
-
-def calculate_voltage_rms(
-    voltage_v: np.ndarray,
-    timestamps: np.ndarray,
-    start_time_s: float,
-    end_time_s: float,
-) -> float:
-    mask = (timestamps >= start_time_s) & (timestamps < end_time_s)
-    values = voltage_v[mask]
-    if values.size == 0:
-        raise ValueError("No voltage samples fall inside the detected current-event window")
-    return float(np.sqrt(np.mean(np.square(values))))
 
 
 def empty_row(filename: str, phase: str):
@@ -343,114 +212,186 @@ def empty_row(filename: str, phase: str):
         "Phase": phase,
         "Current Source": "",
         "Current Channel": "",
+        "CT Minimum Peak (A)": "",
+        **dict.fromkeys(DETECTION_COLUMNS.values(), ""),
+        "CT Peak (A)": "",
+        "Current Selection Reason": "",
         "Voltage Channel": "",
         "Sample Rate (Hz)": "",
         "Start Time (s)": "",
+        "End Time (s)": "",
         "Duration (s)": "",
         "Peak Current (kA)": "",
         "RMS Current (kA)": "",
         "I^2t (A^2 s x10^6)": "",
         "RMS Voltage (V)": "",
+        "Voltage RMS Start Time (s)": "",
+        "Voltage RMS End Time (s)": "",
         "Status": "",
     }
 
 
-def process_open_file(reader: READER_HANDLE, path: Path) -> list[dict]:
+@dataclass
+class PhaseAnalysis:
+    """Results and original SI waveforms retained for a future review screen."""
+    row: dict
+    current_a: np.ndarray | None = None
+    current_t: np.ndarray | None = None
+    voltage_v: np.ndarray | None = None
+    voltage_t: np.ndarray | None = None
+    event: tuple[int, int] | None = None
+
+
+def select_current_channel(ct, shunt, read_current, threshold_a):
+    """Read CT first; a qualifying CT is never replaced merely for a missing event."""
+    ct_peak = None
+    if ct is None:
+        reason = "CT_MISSING"
+    else:
+        try:
+            data = read_current(ct)
+            ct_peak = float(np.max(np.abs(data[0])))
+            if ct_is_usable(data[0], threshold_a):
+                return ct, "C.T.", data, "CT_MEETS_THRESHOLD", ct_peak
+            reason = "CT_FLAT" if ct_peak == 0 else "CT_BELOW_THRESHOLD"
+        except Exception as exc:
+            reason = f"CT_READ_ERROR:{exc}"
+    if shunt is not None:
+        try:
+            return shunt, "Shunt", read_current(shunt), reason, ct_peak
+        except Exception as exc:
+            reason += f";SHUNT_READ_ERROR:{exc}"
+    else:
+        reason += ";NO_SHUNT_CHANNEL"
+    return None, "", None, reason, ct_peak
+
+
+def analyse_open_file(reader: READER_HANDLE, path: Path, settings: ProcessingSettings) -> list[PhaseAnalysis]:
     measurement_info = DWMeasurementInfo(0, 0, 0, 0)
     check_error(lib, lib.DWIGetMeasurementInfo(reader, ctypes.byref(measurement_info)))
-    sample_rate_hz = float(measurement_info.sample_rate)
-
+    base_rate = float(measurement_info.sample_rate)
+    if not math.isfinite(base_rate) or base_rate <= 0:
+        raise ValueError("Invalid measurement sample rate")
     channels = get_channels(reader)
-    rows = []
+    selections = {phase: choose_phase_channels(channels, phase) for phase in PHASES}
 
+    # Cache candidate signals once, preserving native timestamp offsets between
+    # channels. Use a single origin for all phases and both voltage and current.
+    cache = {}
+    for ct, shunt, voltage, _ in selections.values():
+        for ch, quantity in ((ct, "current"), (shunt, "current"), (voltage, "voltage")):
+            if ch is None or ch.index in cache:
+                continue
+            try:
+                values, times, is_async = read_channel(reader, ch, base_rate)
+                values = values * unit_factor_to_si(channel_unit(ch), quantity)
+                validate_signal(values, times)
+                cache[ch.index] = (values, times, is_async)
+            except Exception as exc:
+                cache[ch.index] = exc
+    origin = min((data[1][0] for data in cache.values() if not isinstance(data, Exception)), default=0.0)
+    cache = {index: data if isinstance(data, Exception) else (data[0], data[1] - origin, data[2])
+             for index, data in cache.items()}
+
+    def read_cached(ch):
+        data = cache[ch.index]
+        if isinstance(data, Exception):
+            raise data
+        return data
+
+    results = []
     for phase in PHASES:
         row = empty_row(path.name, phase)
-        row["Sample Rate (Hz)"] = sample_rate_hz
-        statuses = []
-
-        if not math.isclose(sample_rate_hz, EXPECTED_SAMPLE_RATE_HZ, rel_tol=0.0, abs_tol=1.0):
-            statuses.append(f"UNEXPECTED_SAMPLE_RATE_{sample_rate_hz:g}Hz")
-
-        current_ch, source, voltage_ch, selection_warnings = choose_phase_channels(channels, phase)
-        statuses.extend(selection_warnings)
-
-        if current_ch is None:
-            statuses.append("NO_CURRENT_CHANNEL")
-            row["Status"] = ";".join(statuses)
-            rows.append(row)
-            continue
-
+        row.update(settings_columns(settings))
+        result = PhaseAnalysis(row)
+        results.append(result)
+        ct, shunt, voltage_ch, warnings = selections[phase]
+        statuses = list(warnings)
+        current_ch, source, current, reason, ct_peak = select_current_channel(
+            ct, shunt, read_cached, settings.ct_min_peak_a)
+        row["Current Selection Reason"] = reason
+        row["CT Peak (A)"] = ct_peak if ct_peak is not None else ""
         row["Current Source"] = source
-        row["Current Channel"] = channel_name(current_ch)
+        if source == "Shunt":
+            statuses.append("SHUNT_FALLBACK")
         if voltage_ch is not None:
             row["Voltage Channel"] = channel_name(voltage_ch)
+            try:
+                result.voltage_v, result.voltage_t, voltage_async = read_cached(voltage_ch)
+            except Exception as exc:
+                statuses.append(f"VOLTAGE_READ_ERROR:{exc}")
+        else:
+            statuses.append("NO_VOLTAGE_CHANNEL")
+        if current_ch is None:
+            statuses.append("NO_USABLE_CURRENT_CHANNEL")
+            row["Status"] = ";".join(statuses)
+            continue
 
+        row["Current Channel"] = channel_name(current_ch)
+        current_a, current_t, current_async = current
+        result.current_a, result.current_t = current_a, current_t
         try:
-            current_raw, current_t, current_async = read_channel(reader, current_ch, sample_rate_hz)
-            current_factor = unit_factor_to_si(channel_unit(current_ch), "current")
-            current_a = current_raw * current_factor
+            # Detection hold times require regularly spaced current samples.
+            # Do not silently apply the base rate to asynchronous/gapped data.
+            dt = np.diff(current_t)
+            interval = float(np.median(dt)) if dt.size else 1.0 / base_rate
+            if dt.size and not np.allclose(dt, interval, rtol=1e-5, atol=1e-9):
+                raise ValueError("NONUNIFORM_CURRENT_TIMESTAMPS")
+            sample_rate_hz = 1.0 / interval
+            row["Sample Rate (Hz)"] = sample_rate_hz
+            if not math.isclose(sample_rate_hz, EXPECTED_SAMPLE_RATE_HZ, rel_tol=0.0, abs_tol=1.0):
+                statuses.append(f"UNEXPECTED_SAMPLE_RATE_{sample_rate_hz:g}Hz")
+            event, event_status = detect_event(
+                current_a, sample_rate_hz, settings.detection_config())
+            if event is None:
+                statuses.append(event_status)
+                row["Status"] = ";".join(statuses)
+                continue
+            result.event = event
+            if event_status != "OK":
+                statuses.append(event_status)
+            start, end = event
+            if start == 0:
+                statuses.append("EVENT_START_AT_RECORD_BOUNDARY")
+            if end == current_a.size:
+                statuses.append("EVENT_END_AT_RECORD_BOUNDARY")
+            metrics = calculate_current_metrics(current_a, current_t, current_async, sample_rate_hz, start, end)
         except Exception as exc:
-            statuses.append(f"CURRENT_READ_ERROR:{exc}")
+            statuses.append(f"CURRENT_ANALYSIS_ERROR:{exc}")
             row["Status"] = ";".join(statuses)
-            rows.append(row)
             continue
-
-        event, event_status = detect_event(current_a, sample_rate_hz)
-        if event is None:
-            statuses.append(event_status)
-            row["Status"] = ";".join(statuses)
-            rows.append(row)
-            continue
-
-        if event_status != "OK":
-            statuses.append(event_status)
-
-        start, end = event
-        metrics = calculate_current_metrics(
-            current_a,
-            current_t,
-            current_async,
-            sample_rate_hz,
-            start,
-            end,
-        )
 
         row["Start Time (s)"] = metrics["start_time_s"]
+        row["End Time (s)"] = metrics["end_time_s"]
         row["Duration (s)"] = metrics["duration_s"]
         row["Peak Current (kA)"] = metrics["peak_current_a"] / 1_000.0
         row["RMS Current (kA)"] = metrics["rms_current_a"] / 1_000.0
         row["I^2t (A^2 s x10^6)"] = metrics["i2t_a2s"] / 1_000_000.0
 
-        if voltage_ch is None:
-            statuses.append("NO_VOLTAGE_CHANNEL")
-        else:
+        if result.voltage_v is not None:
             try:
-                voltage_raw, voltage_t, _ = read_channel(reader, voltage_ch, sample_rate_hz)
-                voltage_factor = unit_factor_to_si(channel_unit(voltage_ch), "voltage")
-                voltage_v = voltage_raw * voltage_factor
                 row["RMS Voltage (V)"] = calculate_voltage_rms(
-                    voltage_v,
-                    voltage_t,
-                    metrics["start_time_s"],
-                    metrics["end_time_s"],
-                )
-            except Exception as exc:
-                statuses.append(f"VOLTAGE_READ_ERROR:{exc}")
-
+                    result.voltage_v, result.voltage_t, metrics["start_time_s"], base_rate, voltage_async)
+                row["Voltage RMS Start Time (s)"] = float(result.voltage_t[0])
+                row["Voltage RMS End Time (s)"] = metrics["start_time_s"]
+            except ValueError as exc:
+                statuses.append(str(exc))
         row["Status"] = ";".join(statuses) if statuses else "OK"
-        rows.append(row)
-
-    return rows
+    return results
 
 
-def process_file(reader: READER_HANDLE, path: Path) -> list[dict]:
+def process_open_file(reader: READER_HANDLE, path: Path, settings: ProcessingSettings) -> list[dict]:
+    return [result.row for result in analyse_open_file(reader, path, settings)]
+
+
+def process_file(reader: READER_HANDLE, path: Path, settings: ProcessingSettings) -> list[dict]:
     file_info = DWFileInfo(0, 0, 0)
     opened = False
     try:
         c_filename = ctypes.c_char_p(str(path).encode("utf-8"))
         check_error(lib, lib.DWIOpenDataFile(reader, c_filename, ctypes.byref(file_info)))
         opened = True
-        return process_open_file(reader, path)
+        return process_open_file(reader, path, settings)
     finally:
         if opened:
             check_error(lib, lib.DWICloseDataFile(reader))
@@ -484,7 +425,25 @@ def main():
         help="Output CSV path (default: <folder>/dxd_summary.csv)",
     )
     parser.add_argument("--recursive", action="store_true", help="Also search subfolders")
+    parser.add_argument("--ct-min-peak-a", type=float, help="Shared CT peak threshold in amps; saved for future runs")
+    for field in fields(DetectionConfig):
+        note = "; 0 disables duration filtering" if field.name == "minimum_event_ms" else ""
+        parser.add_argument("--" + field.name.replace("_", "-"), type=float,
+                            help=f"{DETECTION_COLUMNS[field.name]}; saved for future runs (default: {field.default}{note})")
+    parser.add_argument("--settings", type=Path, default=default_settings_path(), help="Settings JSON path")
     args = parser.parse_args()
+    try:
+        settings = load_settings(args.settings)
+        if settings is None and args.ct_min_peak_a is not None:
+            settings = ProcessingSettings(args.ct_min_peak_a)
+        if settings is not None:
+            overrides = {field.name: getattr(args, field.name) for field in fields(ProcessingSettings)
+                         if getattr(args, field.name) is not None}
+            settings = replace(settings, **overrides)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    if settings is None:
+        parser.error("No CT threshold configured. Supply --ct-min-peak-a AMPS on the first run.")
 
     folder = args.folder.resolve()
     if not folder.is_dir():
@@ -495,7 +454,14 @@ def main():
     if not files:
         raise SystemExit(f"No .dxd files found in {folder}")
 
-    lib = load_library()
+    if overrides:
+        try:
+            save_settings(settings, args.settings)
+        except OSError as exc:
+            parser.error(f"Cannot save settings: {exc}")
+    print(f"CT minimum peak: {settings.ct_min_peak_a:g} A (settings: {args.settings})")
+    print(f"Minimum event duration: {settings.minimum_event_ms:g} ms")
+    lib = configure_library(load_library())
     reader = READER_HANDLE()
     check_error(lib, lib.DWICreateReader(ctypes.byref(reader)))
 
@@ -504,11 +470,12 @@ def main():
         for number, path in enumerate(files, start=1):
             print(f"[{number}/{len(files)}] {path.name}")
             try:
-                rows.extend(process_file(reader, path))
+                rows.extend(process_file(reader, path, settings))
             except Exception as exc:
                 # Keep the batch running and leave an auditable failure row for each phase.
                 for phase in PHASES:
                     row = empty_row(path.name, phase)
+                    row.update(settings_columns(settings))
                     row["Status"] = f"FILE_ERROR:{exc}"
                     rows.append(row)
     finally:
