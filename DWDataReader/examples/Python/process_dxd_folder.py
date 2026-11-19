@@ -27,7 +27,7 @@ from DWDataReaderHeader import (
 )
 
 '''
-python DWDataReader/examples/Python/process_dxd_folder.py "D:/Eaton_P02478763_252108361" -o results.csv
+python DWDataReader/examples/Python/process_dxd_folder.py "D:/Ausnet - P02616733 - 252108466/Dewesoft" -o "D:/Ausnet - P02616733 - 252108466/Dewesoft/results.csv"
 '''
 
 PHASES = ("Red", "White", "Blue")

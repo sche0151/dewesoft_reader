@@ -13,7 +13,7 @@ from dxd_analysis import DetectionConfig
 
 @dataclass(frozen=True)
 class ProcessingSettings:
-    ct_min_peak_a: float
+    ct_min_peak_a: float = 10
     minimum_event_ms: float = 3.0
     rms_window_ms: float = 1.0
     start_fraction_of_peak: float = 0.01
