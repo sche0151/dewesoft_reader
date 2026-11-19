@@ -7,7 +7,7 @@ from DWDataReaderHeader import (
     decode_bytes, check_error,
 )
 
-FOLDER = Path(r"D:/Ausnet - P02616733 - 252108466/Dewesoft")
+FOLDER = Path(r"C:/Users/shang/Desktop/Ausnet - P02616733 - 252108466/Dewesoft")
 lib = load_library()
 reader = READER_HANDLE()
 
@@ -53,9 +53,11 @@ try:
 
             if frames:
                 output = path.with_suffix(".csv")
-                pd.concat(frames, axis=1).sort_index().to_csv(
-                    output, index_label="Time (s)"
-                )
+                data = pd.concat(frames, axis=1).sort_index()
+                start = pd.to_datetime(info.start_store_time, unit="D", origin="1899-12-30", utc=True)
+                data.index = start + pd.to_timedelta(data.index, unit="s")
+                data.index = data.index.tz_convert("Australia/Sydney")
+                data.to_csv(output, index_label="Time (Australia/Sydney)")
                 print(f"Exported: {output.name}")
         finally:
             call(lib.DWICloseDataFile)
